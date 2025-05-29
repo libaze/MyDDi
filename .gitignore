@@ -197,4 +197,5 @@ cython_debug/
 *.zip
 *.pth
 *.npy
+*.dgl
 data/
