@@ -1,0 +1,49 @@
+# ================= 数据集配置 =================
+dataset:
+  name: "drugbank"  # 可选: drugbank/twosides/kegg
+  path: "/home/work/workspace/liu_lei/MyDDi/data/finetune/DRKGWithDrugBank"
+  type: "binary_class"  # 可选: binary_class/multi_label/multi_class
+  images_path: "/home/work/workspace/liu_lei/MyDDi/data/drug_images/drugbank_images"
+
+# ================= 模型配置 =================
+model:
+  type: "only_kg"      # 可选: only_mol/only_kg/mol+kg
+  num_classes: 1        # 分类数
+  mol_model:
+    type: "ResNet18"    # 可选: ResNet18/34/50/101/152/swin_base_patch4_window7_224
+    pretrained: True
+  kg_model:
+    g_type: "GraphConv"         # 可选: GraphConv/GATConv
+    pretrained: False
+    input_dim: 256
+    hidden_dim: 512     # 隐藏层维度
+    num_heads: 4        # GATConv专用参数：注意力头数
+    dropout: 0.5        # Dropout概率
+  fusion_method: "concat"  # 当 type=mol+kg 时，特征融合方式：concat/add
+
+# ================= 训练配置 =================
+training:
+  device: "cuda:0"        # 训练设备
+  epochs: 50              # 训练轮数
+  batch_size: 64          # 批次大小
+  num_workers: 8
+  seed: 42                # 随机数种子
+  fold_k:
+    n_splits: 5           # k折验证 -> 默认5折
+    shuffle: True         # 随机打乱
+    val_ratio: 0.2        # 验证集占训练集的比例，默认：0.2
+  optimizer:
+    type: "SGD"         # 优化器类型 可选：AdamW, Adam, SGD
+    lr: !!float 1e-3              # 学习率
+    weight_decay: !!float 1e-5    # L2正则化
+  scheduler:
+    type: "ReduceLROnPlateau"
+    patience: 5           # 学习率衰减耐心值
+  early_stopping: 5       # 早停轮数
+  checkpoint: "./ckpts"  # 模型保存路径
+
+# ================= 日志配置 =================
+logging:
+  tensorboard: true       # 启用TensorBoard
+  log_dir: "./logs"
+  log_interval: 50        # 打印频率(批次)
