@@ -1,8 +1,13 @@
+import os.path
+
 import dgl
 import torch
 import torch.nn.functional as F
 import numpy as np
+from sklearn.model_selection import train_test_split
 import pandas as pd
+from tqdm import tqdm
+
 from data_process.generate_graph import gen_hetero_graph
 from sklearn.metrics import roc_auc_score
 from model.kg_model import HeteroRGCN
@@ -84,13 +89,7 @@ from model.kg_model import HeteroRGCN
 #         return pred.item()
 
 
-import dgl
-import torch
-import numpy as np
-from sklearn.model_selection import train_test_split
-
-
-def split_link_prediction_graph(graph, test_ratio=0.2, val_ratio=0.1):
+def split_link_prediction_graph(graph, test_ratio=0.3):
     """
     通用异构图形链接预测数据划分
     参数：
@@ -101,13 +100,21 @@ def split_link_prediction_graph(graph, test_ratio=0.2, val_ratio=0.1):
         train_graph, val_graph, test_graph,
         neg_samples_dict (包含各关系类型的负样本)
     """
+    # 若图数据存在，则加载图数据
+    if os.path.exists('graph_data.dgl'):
+        loaded_graphs, label_dict = dgl.load_graphs('graph_data.dgl')
+        train_graph = loaded_graphs[0]
+        test_graph = loaded_graphs[1]
+        neg_samples_dict = label_dict['neg_samples']
+        return train_graph, test_graph, neg_samples_dict
+
     # 1. 为每个关系类型生成划分
     neg_samples_dict = {}
     train_edges = {}
-    val_edges = {}
     test_edges = {}
 
-    for canonical_etype in graph.canonical_etypes:
+    for idx, canonical_etype in enumerate(graph.canonical_etypes):
+        print(f'[{idx + 1}/{len(graph.canonical_etypes)}]\tCanonical etype:', canonical_etype)
         src_type, rel_type, dst_type = canonical_etype
         src, dst = graph.edges(etype=canonical_etype)
         edges = torch.stack([src, dst], dim=1)
@@ -118,51 +125,48 @@ def split_link_prediction_graph(graph, test_ratio=0.2, val_ratio=0.1):
         neg_dst = torch.randint(0, graph.num_nodes(dst_type), (num_neg,))
 
         # 过滤掉真实存在的边
-        for i in range(num_neg):
+        for i in tqdm(range(num_neg), desc=f'{str(canonical_etype)}负采样...'):
             while graph.has_edges_between(neg_src[i], neg_dst[i], etype=canonical_etype):
                 neg_src[i] = torch.randint(0, graph.num_nodes(src_type), (1,))
                 neg_dst[i] = torch.randint(0, graph.num_nodes(dst_type), (1,))
         neg_samples = torch.stack([neg_src, neg_dst], dim=1)
 
         # 划分正样本
-        train_pos, temp_pos = train_test_split(
-            edges, test_size=test_ratio + val_ratio, random_state=42
-        )
-        val_pos, test_pos = train_test_split(
-            temp_pos, test_size=test_ratio / (test_ratio + val_ratio), random_state=42
+        train_pos, test_pos = train_test_split(
+            edges, test_size=test_ratio, random_state=42
         )
 
         # 划分负样本（相同比例）
-        train_neg, temp_neg = train_test_split(
-            neg_samples, test_size=test_ratio + val_ratio, random_state=42
-        )
-        val_neg, test_neg = train_test_split(
-            temp_neg, test_size=test_ratio / (test_ratio + val_ratio), random_state=42
+        train_neg, test_neg = train_test_split(
+            neg_samples, test_size=test_ratio, random_state=42
         )
 
         # 存储划分结果
         train_edges[canonical_etype] = train_pos
-        val_edges[canonical_etype] = val_pos
         test_edges[canonical_etype] = test_pos
         neg_samples_dict[canonical_etype] = {
             'train': train_neg,
-            'val': val_neg,
             'test': test_neg
         }
 
     # 2. 构建子图
     train_graph = dgl.heterograph(train_edges)
-    val_graph = dgl.heterograph(val_edges)
     test_graph = dgl.heterograph(test_edges)
 
     # 3. 保留原始特征
     for ntype in graph.ntypes:
         for key in graph.nodes[ntype].data:
             train_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
-            val_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
             test_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
 
-    return train_graph, val_graph, test_graph, neg_samples_dict
+    # 保存图数据和负样本信息
+    dgl.save_graphs(
+        'graph_data.dgl',  # 保存文件名
+        [train_graph, test_graph],  # 要保存的图列表
+        {'neg_samples': neg_samples_dict}  # 额外数据（负样本字典）
+    )
+
+    return train_graph, test_graph, neg_samples_dict
 
 
 def pretrain_kg():
@@ -184,21 +188,22 @@ def pretrain_kg():
     # 加载数据集
     graph = gen_hetero_graph(drkg, drkg_relations, entities, ID2H_ID)
 
+    # 获取实体和关系类型
+    entity_types = graph.ntypes
+    relation_types = graph.etypes
+
     # 打印图摘要
     print("\nGraph summary:")
-    print(f"Node types: {graph.ntypes}")
-    print(f"Edge types: {graph.etypes}")
+    print(f"Node types: {entity_types}")
+    print(f"Edge types: {relation_types}")
     print(f"Total nodes: {graph.num_nodes():,}")
     print(f"Total edges: {graph.num_edges():,}")
 
-    # 获取实体和关系类型
-    entity_types = graph.ntypes
-    # relation_types = graph.etypes
-    print(f"实体类型: {entity_types}")
-    print(f"关系类型: {relation_types}")
+    train_graph, test_graph, neg_samples_dict = split_link_prediction_graph(graph)
+
 
     # 设置设备
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
 
     # 初始化模型
@@ -207,8 +212,8 @@ def pretrain_kg():
     # optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     # 训练循环
-    # num_epochs = 50
-    # best_val_auc = 0
+    num_epochs = 50
+    best_val_auc = 0
 
     # for epoch in range(num_epochs):
     #     loss = pretrain_one_epoch(model, graph, optimizer, device)

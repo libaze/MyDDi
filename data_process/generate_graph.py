@@ -29,7 +29,7 @@ def gen_hetero_graph(drkg, drkg_relations, entities, ID2H_ID):
     ID2Entity = dict(zip(entities[:, 1], entities[:, 0]))
     ID2DrkgRelation = dict(zip(drkg_relations[:, 1], drkg_relations[:, 0]))
 
-    hetero_graph_path = '/home/work/workspace/liu_lei/MyDDi/data_process/hetero_graph.dgl'
+    hetero_graph_path = 'hetero_graph.dgl'
     if os.path.exists(hetero_graph_path):
         hetero_graph, _ = dgl.load_graphs(hetero_graph_path)
         return hetero_graph[0]
@@ -79,6 +79,7 @@ if __name__ == '__main__':
 
     # 生成图
     hetero_graph = gen_hetero_graph(drkg, drkg_relations, entities, ID2H_ID)
+    print(hetero_graph)
     
 
     # 打印图摘要
