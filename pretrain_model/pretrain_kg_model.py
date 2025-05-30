@@ -1,52 +1,54 @@
 import os.path
-
 import dgl
 import torch
+import pickle
 import torch.nn.functional as F
 import numpy as np
 from sklearn.model_selection import train_test_split
 import pandas as pd
 from tqdm import tqdm
-
 from data_process.generate_graph import gen_hetero_graph
 from sklearn.metrics import roc_auc_score
 from model.kg_model import HeteroRGCN
 
 
-# # 定义训练函数
-# def pretrain_one_epoch(model, graph, optimizer, device):
-#     model.train()
-#     optimizer.zero_grad()
-#
-#     # 获取训练边
-#     train_edges = {}
-#     for rel_type in relation_types:
-#         src, dst = graph.edges(etype=rel_type)
-#         train_edges[rel_type] = (src, dst)
-#
-#     # 计算损失
-#     loss = 0
-#     for rel_type in relation_types:
-#         pos_src, pos_dst = train_edges[rel_type]
-#         neg_dst = torch.randint(0, graph.number_of_nodes(entity_types[-1]), (pos_src.shape[0],))
-#
-#         # 正样本预测
-#         pos_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), pos_src, pos_dst))
-#         # 负样本预测
-#         neg_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), pos_src, neg_dst))
-#
-#         # 二元交叉熵损失
-#         pos_loss = F.binary_cross_entropy(pos_pred, torch.ones_like(pos_pred))
-#         neg_loss = F.binary_cross_entropy(neg_pred, torch.zeros_like(neg_pred))
-#         loss += pos_loss + neg_loss
-#
-#     # 反向传播
-#     loss.backward()
-#     optimizer.step()
-#
-#     return loss.item()
-#
-#
+# 定义训练函数
+def pretrain_one_epoch(model, graph, optimizer, device):
+    model.train()
+    optimizer.zero_grad()
+
+    entity_types = graph.ntypes
+    relation_types = graph.etypes
+
+    # 获取训练边
+    train_edges = {}
+    for rel_type in relation_types:
+        src, dst = graph.edges(etype=rel_type)
+        train_edges[rel_type] = (src, dst)
+
+    # 计算损失
+    loss = 0
+    for rel_type in relation_types:
+        pos_src, pos_dst = train_edges[rel_type]
+        neg_dst = torch.randint(0, graph.number_of_nodes(entity_types[-1]), (pos_src.shape[0],))
+
+        # 正样本预测
+        pos_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), pos_src, pos_dst))
+        # 负样本预测
+        neg_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), pos_src, neg_dst))
+
+        # 二元交叉熵损失
+        pos_loss = F.binary_cross_entropy(pos_pred, torch.ones_like(pos_pred))
+        neg_loss = F.binary_cross_entropy(neg_pred, torch.zeros_like(neg_pred))
+        loss += pos_loss + neg_loss
+
+    # 反向传播
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+
+
 # # 定义评估函数
 # def evaluate(model, graph, edges, device):
 #     model.eval()
@@ -101,11 +103,12 @@ def split_link_prediction_graph(graph, test_ratio=0.3):
         neg_samples_dict (包含各关系类型的负样本)
     """
     # 若图数据存在，则加载图数据
-    if os.path.exists('graph_data.dgl'):
-        loaded_graphs, label_dict = dgl.load_graphs('graph_data.dgl')
+    if os.path.exists('pretrain_graph_data.dgl') and os.path.exists('neg_samples.pkl'):
+        loaded_graphs, label_dict = dgl.load_graphs('pretrain_graph_data.dgl')
         train_graph = loaded_graphs[0]
         test_graph = loaded_graphs[1]
-        neg_samples_dict = label_dict['neg_samples']
+        with open('neg_samples.pkl', 'rb') as f:
+            neg_samples_dict = pickle.load(f)
         return train_graph, test_graph, neg_samples_dict
 
     # 1. 为每个关系类型生成划分
@@ -142,8 +145,8 @@ def split_link_prediction_graph(graph, test_ratio=0.3):
         )
 
         # 存储划分结果
-        train_edges[canonical_etype] = train_pos
-        test_edges[canonical_etype] = test_pos
+        train_edges[canonical_etype] = (train_pos[:, 0], train_pos[:, 1])
+        test_edges[canonical_etype] = (test_pos[:, 0], test_pos[:, 1])
         neg_samples_dict[canonical_etype] = {
             'train': train_neg,
             'test': test_neg
@@ -159,12 +162,11 @@ def split_link_prediction_graph(graph, test_ratio=0.3):
             train_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
             test_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
 
-    # 保存图数据和负样本信息
-    dgl.save_graphs(
-        'graph_data.dgl',  # 保存文件名
-        [train_graph, test_graph],  # 要保存的图列表
-        {'neg_samples': neg_samples_dict}  # 额外数据（负样本字典）
-    )
+    # 保存图数据
+    dgl.save_graphs('pretrain_graph_data.dgl', [train_graph, test_graph])
+    # 单独保存负样本字典
+    with open('neg_samples.pkl', 'wb') as f:
+        pickle.dump(neg_samples_dict, f)
 
     return train_graph, test_graph, neg_samples_dict
 
@@ -175,9 +177,9 @@ def pretrain_kg():
     np.random.seed(42)
 
     # 使用显式列规范加载数据
-    entities = pd.read_csv('../data/finetune/DRKGWithDrugBank/entities_add_h_id.csv').values
-    drkg_relations = pd.read_csv('../data/finetune/DRKGWithDrugBank/drkg_relations.csv').values
-    drkg = pd.read_csv('../data/finetune/DRKGWithDrugBank/drkg.csv').values
+    entities = pd.read_csv('data/finetune/DRKGWithDrugBank/entities_add_h_id.csv').values
+    drkg_relations = pd.read_csv('data/finetune/DRKGWithDrugBank/drkg_relations.csv').values
+    drkg = pd.read_csv('data/finetune/DRKGWithDrugBank/drkg.csv').values
     ID2H_ID = dict(zip(entities[:, 1], entities[:, 2]))
 
     # 打印基本信息
@@ -200,23 +202,25 @@ def pretrain_kg():
     print(f"Total edges: {graph.num_edges():,}")
 
     train_graph, test_graph, neg_samples_dict = split_link_prediction_graph(graph)
-
+    # print(train_graph)
+    # print(test_graph)
+    # print(neg_samples_dict)
 
     # 设置设备
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
 
     # 初始化模型
-    # graph = graph.to(device)
-    # model = HeteroRGCN(graph, in_size=64, hidden_size=128, out_size=1, num_layers=2).to(device)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    graph = graph.to(device)
+    model = HeteroRGCN(graph, in_size=64, hidden_size=128, out_size=1, num_layers=2).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     # 训练循环
     num_epochs = 50
     best_val_auc = 0
 
-    # for epoch in range(num_epochs):
-    #     loss = pretrain_one_epoch(model, graph, optimizer, device)
+    for epoch in range(num_epochs):
+        loss = pretrain_one_epoch(model, graph, optimizer, device)
     #     train_auc = evaluate(model, graph, train_mask, device)
     #     val_auc = evaluate(model, graph, val_mask, device)
     #
