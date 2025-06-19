@@ -1,6 +1,6 @@
 import os
 from collections import defaultdict
-import dgl
+# import dgl
 import pandas as pd
 import torch
 from tqdm import tqdm

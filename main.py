@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import yaml
 from finetune import finetune
+from pretrain import pretrain
 
 
 def set_all_seeds(seed=42):
@@ -31,8 +32,8 @@ def load_config(config_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Drug Interaction Prediction')
-    parser.add_argument('-m', '--mode', type=str, default='finetune')
-    parser.add_argument('-c', '--config', type=str, default='./config/finetune/train.yaml',
+    parser.add_argument('-m', '--mode', type=str, default='pretrain', choices=['finetune', 'pretrain'])
+    parser.add_argument('-c', '--config', type=str, default='./config/pretrain/train.yaml',
                         help='path to configuration file')
     args = parser.parse_args(args=[])
     config = load_config(args.config)
@@ -41,7 +42,7 @@ def main():
     if args.mode == 'finetune':
         finetune(config)
     else:
-        pass
+        pretrain(config)
 
 
 

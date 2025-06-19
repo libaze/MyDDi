@@ -1,6 +1,12 @@
 from pretrain_model import pretrain_kg_model
 
 
-if __name__ == '__main__':
-    pretrain_kg_model.pretrain_kg()
+def pretrain(config):
+    if config['type'] == 'kg':
+        pretrain_kg_model.pretrain_kg(config)
+    else:
+        pass
+
+
+
 

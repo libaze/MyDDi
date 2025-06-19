@@ -199,4 +199,5 @@ cython_debug/
 *.npy
 *.dgl
 *.pkl
+*.pt
 data/

@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import dgl.function as fn
 from model.base_utils import weights_init
 
 
@@ -26,6 +27,15 @@ class DDIClassifier(nn.Module):
         x = torch.cat((x1, x2), dim=1)
         logit = self.classifier(x)
         return logit
+
+
+class ScorePredictor(nn.Module):
+    def forward(self, edge_subgraph, h):
+        with edge_subgraph.local_scope():
+            edge_subgraph.ndata['h'] = h
+            for etype in edge_subgraph.canonical_etypes:
+                edge_subgraph.apply_edges(fn.u_dot_v('h', 'h', 'score'), etype=etype)
+            return edge_subgraph.edata['score']
 
 
 if __name__ == '__main__':

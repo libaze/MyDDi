@@ -1,248 +1,160 @@
 import os.path
-import dgl
-import torch
-import pickle
-import torch.nn.functional as F
+
 import numpy as np
-from sklearn.model_selection import train_test_split
-import pandas as pd
+import torch
+import dgl
+from dgl.dataloading import NeighborSampler, DataLoader
+from dgl.dataloading.negative_sampler import GlobalUniform
 from tqdm import tqdm
-from data_process.generate_graph import gen_hetero_graph
-from sklearn.metrics import roc_auc_score
-from model.kg_model import HeteroRGCN
+from data_process.dataset import DRKGDGLDataset
+import torch.nn.functional as F
+from model.kg_model import DRKGModel
+from model.predictor import ScorePredictor
+from utils.early_stopping import EarlyStopping
+from utils.optimizer import get_optimizer, get_scheduler
+from utils.train_test import pretrain_kg_eval
 
 
-# 定义训练函数
-def pretrain_one_epoch(model, graph, optimizer, device):
-    model.train()
-    optimizer.zero_grad()
+def pretrain_kg(config):
+    device = torch.device(config['training']['device'])
+    dataset = DRKGDGLDataset(config['dataset']['path'])
 
-    entity_types = graph.ntypes
-    relation_types = graph.etypes
+    g = dataset[0]
+    g = g.to(device)
 
-    # 获取训练边
-    train_edges = {}
-    for rel_type in relation_types:
-        src, dst = graph.edges(etype=rel_type)
-        train_edges[rel_type] = (src, dst)
+    rel_names = g.etypes
+    node_names = g.ntypes
+    print('rel_names: ', rel_names)
+    print('node_names: ', node_names)
 
-    # 计算损失
-    loss = 0
-    for rel_type in relation_types:
-        pos_src, pos_dst = train_edges[rel_type]
-        neg_dst = torch.randint(0, graph.number_of_nodes(entity_types[-1]), (pos_src.shape[0],))
+    # 划分训练/验证集
+    train_retio = 1 - config["training"]["val_ratio"]
+    train_eids = {etype: g.edges(etype=etype, form='eid')[:int(train_retio * len(g.edges(etype=etype, form='eid')))]
+                  for etype in g.etypes}
+    val_eids = {etype: g.edges(etype=etype, form='eid')[int(train_retio * len(g.edges(etype=etype, form='eid'))): int(
+        train_retio * len(g.edges(etype=etype, form='eid'))) + 1000]
+                for etype in g.etypes}
 
-        # 正样本预测
-        pos_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), pos_src, pos_dst))
-        # 负样本预测
-        neg_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), pos_src, neg_dst))
+    # 采样器
+    sampler = NeighborSampler([config["training"]["batch_size"]] * config["model"]['kg_model']['num_layers'])
+    train_sampler = dgl.dataloading.as_edge_prediction_sampler(
+        sampler,
+        negative_sampler=GlobalUniform(config["training"]['negative_sample_ratio']))
+    val_sampler = dgl.dataloading.as_edge_prediction_sampler(
+        sampler,
+        negative_sampler=GlobalUniform(config["training"]['negative_sample_ratio']))
 
-        # 二元交叉熵损失
-        pos_loss = F.binary_cross_entropy(pos_pred, torch.ones_like(pos_pred))
-        neg_loss = F.binary_cross_entropy(neg_pred, torch.zeros_like(neg_pred))
-        loss += pos_loss + neg_loss
+    # 数据加载器
+    train_dataloader = DataLoader(
+        g, train_eids, train_sampler,
+        device=device, batch_size=config["training"]["batch_size"], shuffle=True, drop_last=False,
+        num_workers=config["training"]["num_workers"]
+    )
+    val_dataloader = DataLoader(
+        g, val_eids, val_sampler,
+        device=device, batch_size=config["training"]["batch_size"], shuffle=False, drop_last=False,
+        num_workers=config["training"]["num_workers"]
+    )
 
-    # 反向传播
-    loss.backward()
-    optimizer.step()
+    model = DRKGModel(**config["model"]['kg_model'], rel_names=rel_names).to(device)
+    predictor = ScorePredictor().to(device)
+    # 优化器
+    optimizer_config = config["training"]["optimizer"]
+    optimizer = get_optimizer(optimizer_config["type"])(
+        model.parameters(),
+        lr=optimizer_config.get("lr", 1e-3),
+        weight_decay=optimizer_config.get("weight_decay", 0.0),
+    )
 
-    return loss.item()
+    scheduler_config = config["training"]["scheduler"]
+    scheduler = get_scheduler(optimizer, scheduler_config)
 
+    early_stopping = EarlyStopping(
+        patience=config["training"]["early_stopping"], verbose=True
+    )
 
-# # 定义评估函数
-# def evaluate(model, graph, edges, device):
-#     model.eval()
-#
-#     with torch.no_grad():
-#         preds = []
-#         labels = []
-#
-#         for rel_type in relation_types:
-#             src, dst = graph.edges(etype=rel_type)
-#             neg_dst = torch.randint(0, graph.number_of_nodes(entity_types[-1]), (src.shape[0],))
-#
-#             # 正样本
-#             pos_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), src, dst))
-#             preds.append(pos_pred.cpu().numpy())
-#             labels.append(np.ones(len(pos_pred)))
-#
-#             # 负样本
-#             neg_pred = model.predict(graph, ((entity_types[0], relation_types[0], entity_types[0]), src, neg_dst))
-#             preds.append(neg_pred.cpu().numpy())
-#             labels.append(np.zeros(len(neg_pred)))
-#
-#         preds = np.concatenate(preds)
-#         labels = np.concatenate(labels)
-#
-#         auc = roc_auc_score(labels, preds)
-#         return auc
-#
-#
-# # 预测新链接的函数
-# def predict_new_link(model, graph, head, head_type, tail, tail_type, relation_type):
-#     model.eval()
-#     with torch.no_grad():
-#         # 获取节点ID
-#         head_id = torch.tensor([head]).to(device)
-#         tail_id = torch.tensor([tail]).to(device)
-#
-#         # 预测
-#         pred = model.predict(graph, ((head_type, relation_type, tail_type), head_id, tail_id))
-#         return pred.item()
-
-
-def split_link_prediction_graph(graph, test_ratio=0.3):
-    """
-    通用异构图形链接预测数据划分
-    参数：
-        graph: DGL异构图
-        test_ratio: 测试集比例
-        val_ratio: 验证集比例
-    返回：
-        train_graph, val_graph, test_graph,
-        neg_samples_dict (包含各关系类型的负样本)
-    """
-    # 若图数据存在，则加载图数据
-    if os.path.exists('pretrain_graph_data.dgl') and os.path.exists('neg_samples.pkl'):
-        loaded_graphs, label_dict = dgl.load_graphs('pretrain_graph_data.dgl')
-        train_graph = loaded_graphs[0]
-        test_graph = loaded_graphs[1]
-        with open('neg_samples.pkl', 'rb') as f:
-            neg_samples_dict = pickle.load(f)
-        return train_graph, test_graph, neg_samples_dict
-
-    # 1. 为每个关系类型生成划分
-    neg_samples_dict = {}
-    train_edges = {}
-    test_edges = {}
-
-    for idx, canonical_etype in enumerate(graph.canonical_etypes):
-        print(f'[{idx + 1}/{len(graph.canonical_etypes)}]\tCanonical etype:', canonical_etype)
-        src_type, rel_type, dst_type = canonical_etype
-        src, dst = graph.edges(etype=canonical_etype)
-        edges = torch.stack([src, dst], dim=1)
-
-        # 生成负样本（确保不存在于图中）
-        num_neg = len(edges)
-        neg_src = torch.randint(0, graph.num_nodes(src_type), (num_neg,))
-        neg_dst = torch.randint(0, graph.num_nodes(dst_type), (num_neg,))
-
-        # 过滤掉真实存在的边
-        for i in tqdm(range(num_neg), desc=f'{str(canonical_etype)}负采样...'):
-            while graph.has_edges_between(neg_src[i], neg_dst[i], etype=canonical_etype):
-                neg_src[i] = torch.randint(0, graph.num_nodes(src_type), (1,))
-                neg_dst[i] = torch.randint(0, graph.num_nodes(dst_type), (1,))
-        neg_samples = torch.stack([neg_src, neg_dst], dim=1)
-
-        # 划分正样本
-        train_pos, test_pos = train_test_split(
-            edges, test_size=test_ratio, random_state=42
-        )
-
-        # 划分负样本（相同比例）
-        train_neg, test_neg = train_test_split(
-            neg_samples, test_size=test_ratio, random_state=42
-        )
-
-        # 存储划分结果
-        train_edges[canonical_etype] = (train_pos[:, 0], train_pos[:, 1])
-        test_edges[canonical_etype] = (test_pos[:, 0], test_pos[:, 1])
-        neg_samples_dict[canonical_etype] = {
-            'train': train_neg,
-            'test': test_neg
-        }
-
-    # 2. 构建子图
-    train_graph = dgl.heterograph(train_edges)
-    test_graph = dgl.heterograph(test_edges)
-
-    # 3. 保留原始特征
-    for ntype in graph.ntypes:
-        for key in graph.nodes[ntype].data:
-            train_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
-            test_graph.nodes[ntype].data[key] = graph.nodes[ntype].data[key]
-
-    # 保存图数据
-    dgl.save_graphs('pretrain_graph_data.dgl', [train_graph, test_graph])
-    # 单独保存负样本字典
-    with open('neg_samples.pkl', 'wb') as f:
-        pickle.dump(neg_samples_dict, f)
-
-    return train_graph, test_graph, neg_samples_dict
-
-
-def pretrain_kg():
-    # 设置随机种子保证可重复性
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    # 使用显式列规范加载数据
-    entities = pd.read_csv('data/finetune/DRKGWithDrugBank/entities_add_h_id.csv').values
-    drkg_relations = pd.read_csv('data/finetune/DRKGWithDrugBank/drkg_relations.csv').values
-    drkg = pd.read_csv('data/finetune/DRKGWithDrugBank/drkg.csv').values
-    ID2H_ID = dict(zip(entities[:, 1], entities[:, 2]))
-
-    # 打印基本信息
-    print(f"Entities: {entities.shape[0]:,} rows")
-    print(f"Relations: {drkg_relations.shape[0]:,} types")
-    print(f"Edges: {drkg.shape[0]:,} connections")
-
-    # 加载数据集
-    graph = gen_hetero_graph(drkg, drkg_relations, entities, ID2H_ID)
-
-    # 获取实体和关系类型
-    entity_types = graph.ntypes
-    relation_types = graph.etypes
-
-    # 打印图摘要
-    print("\nGraph summary:")
-    print(f"Node types: {entity_types}")
-    print(f"Edge types: {relation_types}")
-    print(f"Total nodes: {graph.num_nodes():,}")
-    print(f"Total edges: {graph.num_edges():,}")
-
-    train_graph, test_graph, neg_samples_dict = split_link_prediction_graph(graph)
-    # print(train_graph)
-    # print(test_graph)
-    # print(neg_samples_dict)
-
-    # 设置设备
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
-
-    # 初始化模型
-    graph = graph.to(device)
-    model = HeteroRGCN(graph, in_size=64, hidden_size=128, out_size=1, num_layers=2).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-    # 训练循环
-    num_epochs = 50
+    # 初始化最佳指标
     best_val_auc = 0
 
-    for epoch in range(num_epochs):
-        loss = pretrain_one_epoch(model, graph, optimizer, device)
-    #     train_auc = evaluate(model, graph, train_mask, device)
-    #     val_auc = evaluate(model, graph, val_mask, device)
-    #
-    #     print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss:.4f}, Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
-    #
-    #     if val_auc > best_val_auc:
-    #         best_val_auc = val_auc
-    #         torch.save(model.state_dict(), 'best_model.pth')
-    #
-    # # 加载最佳模型
-    # model.load_state_dict(torch.load('best_model.pth'))
-    #
-    # # 在测试集上评估
-    # test_auc = evaluate(model, graph, test_mask, device)
-    # print(f"测试集AUC: {test_auc:.4f}")
-    #
-    #
-    #
-    # # 示例预测
-    # score = predict_new_link(model, graph, 0, '_N', 100, '_N', '_E')
-    # print(f"链接预测得分: {score:.4f}")
+    for epoch in range(1, config['training']['epochs'] + 1):
+        # ==================== 训练阶段 ====================
+        model.train()
+        predictor.train()
+
+        epoch_loss = []
+
+        # 训练进度条
+        train_bar = tqdm(train_dataloader, desc=f'Epoch {epoch}/{config["training"]["epochs"]}')
+
+        for step, (input_nodes, positive_graph, negative_graph, blocks) in enumerate(train_bar):
+            # 1. 前向传播
+            input_features = blocks[0].srcdata['features']
+            h = model(blocks, input_features)
+
+            # 2. 计算正负样本得分
+            pos_score = predictor(positive_graph, h)
+            neg_score = predictor(negative_graph, h)
+
+            # 3. 异构图的损失计算
+            loss = 0
+            num_rels = 0
+
+            for rel_type in pos_score.keys():
+                if pos_score[rel_type].numel() == 0 or neg_score[rel_type].numel() == 0:
+                    continue
+                # 为每种关系类型计算损失
+                pos_labels = torch.ones_like(pos_score[rel_type])
+                neg_labels = torch.zeros_like(neg_score[rel_type])
+
+                rel_loss = F.binary_cross_entropy_with_logits(
+                    torch.cat([pos_score[rel_type], neg_score[rel_type]]),
+                    torch.cat([pos_labels, neg_labels])
+                )
+                loss += rel_loss
+                num_rels += 1
+
+            loss = loss / num_rels  # 平均所有关系类型的损失
+
+            # 4. 反向传播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # 记录指标
+            epoch_loss.append(loss.item())
+
+            # 更新进度条信息
+            train_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+            # ==================== 验证阶段 ====================
+            if (step + 1) % config['training']['eval_every'] == 0:
+                val_auc = pretrain_kg_eval(model, predictor, val_dataloader)
+                model.train()
+                scheduler.step()
+                # ==================== 日志记录 ====================
+                print(f'\nEpoch {epoch}:')
+                print(f'  Val AUC: {val_auc:.4f}')
+
+                # ==================== 模型保存与早停 ====================
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'predictor_state_dict': predictor.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'best_metric': best_val_auc,
+                    'current_lr': optimizer.param_groups[0]['lr']
+                }
+                early_stopping(val_auc, checkpoint, os.path.join(config['training']['checkpoint'], 'pretrain', 'pretrain_kg_model.pth'))
+
+                if early_stopping.early_stop:
+                    break
 
 
-if __name__ == '__main__':
-    pretrain_kg()
+        # 计算训练指标
+        train_loss = np.mean(epoch_loss)
+
+        print(f'\nEpoch {epoch}: Train Mean Loss: {train_loss:.4f}')
+
+    # 训练结束提示
+    print(f'\nTraining completed. Best validation AUC: {best_val_auc:.4f}')

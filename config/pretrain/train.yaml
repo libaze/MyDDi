@@ -1,49 +1,51 @@
+# ================= pretrain =================
+type: "kg"                # 可选: mol/kg
 # ================= 数据集配置 =================
 dataset:
-  name: "drugbank"  # 可选: drugbank/twosides/kegg
+  # kg
+  name: "drugbank"        # 可选: drugbank/twosides/kegg
   path: "/home/work/workspace/liu_lei/MyDDi/data/finetune/DRKGWithDrugBank"
-  type: "binary_class"  # 可选: binary_class/multi_label/multi_class
+  # mol
   images_path: "/home/work/workspace/liu_lei/MyDDi/data/drug_images/drugbank_images"
+  mol_images_path: "/home/work/workspace/liu_lei/MyDDi/data/pretrain/mol-images-24k"
 
 # ================= 模型配置 =================
 model:
-  type: "kg"      # 可选: mol/kg
-  num_classes: 1        # 分类数
   mol_model:
-    type: "ResNet18"    # 可选: ResNet18/34/50/101/152/swin_base_patch4_window7_224
+    type: "ResNet18"      # 可选: ResNet18/34/50/101/152/swin_base_patch4_window7_224
     pretrained: True
   kg_model:
-    g_type: "GraphConv"         # 可选: GraphConv/GATConv
+    g_type: "GraphConv"   # 可选: GraphConv/GATConv
     pretrained: False
-    input_dim: 256
-    hidden_dim: 512     # 隐藏层维度
-    num_heads: 4        # GATConv专用参数：注意力头数
-    dropout: 0.5        # Dropout概率
-  fusion_method: "concat"  # 当 type=mol+kg 时，特征融合方式：concat/add
+    input_dim: 400
+    hidden_dim: 512       # 隐藏层维度
+    num_layers: 2
+    num_heads: 4          # GATConv专用参数：注意力头数
+    dropout: 0.5          # Dropout概率
+  fusion_method: "concat" # 当 type=mol+kg 时，特征融合方式：concat/add
 
 # ================= 训练配置 =================
 training:
-  device: "cuda:0"        # 训练设备
-  epochs: 50              # 训练轮数
+  device: "cuda:1"        # 训练设备
+  epochs: 5               # 训练轮数
   batch_size: 64          # 批次大小
-  num_workers: 8
+  num_workers: 0
+  k: 5                    # 邻居采样数量
+  negative_sample_ratio: 2    # 负采样率
   seed: 42                # 随机数种子
-  fold_k:
-    n_splits: 5           # k折验证 -> 默认5折
-    shuffle: True         # 随机打乱
-    val_ratio: 0.2        # 验证集占训练集的比例，默认：0.2
+  val_ratio: 0.1        # 验证集占训练集的比例，默认：0.1
   optimizer:
-    type: "SGD"         # 优化器类型 可选：AdamW, Adam, SGD
+    type: "Adam"           # 优化器类型 可选：AdamW, Adam, SGD
     lr: !!float 1e-3              # 学习率
     weight_decay: !!float 1e-5    # L2正则化
   scheduler:
-    type: "ReduceLROnPlateau"
-    patience: 5           # 学习率衰减耐心值
+    type: "StepLR"      # 可选: StepLR/CosineAnnealingLR
+    CosineAnnealingLR:
+      T_max: 25
+      eta_min: !!float 1e-5
+    StepLR:
+      step_size: 50
+      gamma: 0.5
   early_stopping: 5       # 早停轮数
-  checkpoint: "./ckpts"  # 模型保存路径
-
-# ================= 日志配置 =================
-logging:
-  tensorboard: true       # 启用TensorBoard
-  log_dir: "./logs"
-  log_interval: 50        # 打印频率(批次)
+  eval_every: 500         # 没xx个step验证一次
+  checkpoint: "./ckpts"   # 模型保存路径
